@@ -1,33 +1,36 @@
 /*
  * =====================================================================
  *  Projet Objets Communicants - ENSIM
- *  Noeud RELAIS (ID 100) - Arthur & Lucas
+ *  Noeud RELAIS (NODE_RELAI = 1) - Arthur & Lucas
  *  Materiel : Arduino Uno + shield XBee + XBee Pro (802.15.4)
  * =====================================================================
  *
- *  Role : faire passer les trames entre le Hub (000), hors de portee,
+ *  Role : faire passer les trames entre le Hub (0), hors de portee,
  *         et les noeuds qui ne l'atteignent pas directement :
- *         temperature interieure (010), servomoteur (011) et humidite (110).
+ *         temperature interieure (4) et servomoteur (5).
  *         La liste est tenue par noeudDerriereRelais().
+ *         IDs et adresses XBee : libraries/EcostoreNodes (ecostore_nodes.h).
  *
- *  Trame (4 octets) :
+ *  Trame (4 octets), codee et decodee par libraries/FrameProtocol :
  *    [0] 0xAA                          synchro
- *    [1] dest(3) | exp(3) | d9 d8      en-tete
- *    [2] d7 ... d0                     donnees
- *    [3] checksum = (octets 0 a 2) % 256  (voir CHECKSUM_MODULO)
+ *    [1] dest(3) | exp(3) | cmd(2)     en-tete (cmd : READ, WRITE, ERROR)
+ *    [2] valeur sur 8 bits
+ *    [3] checksum = (octets 0 a 2) % 256
  *
  *  Routage :
  *    exp = Hub  et dest derriere le relais  ->  envoyee au noeud dest
  *    dest = Hub et exp derriere le relais   ->  envoyee au Hub
  *    tout le reste                          ->  ignoree
  *
- *  La trame est retransmise sans modification (checksum inchange).
+ *  La trame est retransmise a l'identique (checksum inchange).
  * =====================================================================
  */
 
 #include <SoftwareSerial.h>
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
+#include <ecostore_nodes.h>
+#include <frame_protocol.h>
 
 // ============================ CONFIGURATION ============================
 
@@ -36,53 +39,40 @@ const bool debug = false;
 const unsigned long DELAI_TEST_MS = 2000;
 
 // Cablage du shield :
-//   1 = XBee sur pins 2/3 (SoftwareSerial), moniteur seriea USB dispo pour le debug
+//   1 = XBee sur pins 2/3 (SoftwareSerial), moniteur serie USB dispo pour le debug
 //   0 = XBee sur le Serial materiel (pins 0/1), pas de debug possible
 #define XBEE_SUR_SOFTSERIAL 1
 const uint8_t PIN_XBEE_RX = 2;   // relie a DOUT du XBee
 const uint8_t PIN_XBEE_TX = 3;   // relie a DIN du XBee
-const long    BAUD_XBEE   = 9600;
 const long    BAUD_DEBUG  = 115200;
 
 // Mode d'envoi :
-//   1 = unicast   : le relais change sa destination radio (ATDL) avant chaque envoi
-//   0 = broadcast : DL = 0xFFFF, tout le monde recoit, le tri se fait sur le champ dest
+//   1 = unicast   : le relais change sa destination radio (ATDH/ATDL) avant chaque envoi
+//   0 = broadcast : DH = 0, DL = 0xFFFF, tout le monde recoit, le tri se fait sur le champ dest
 #define MODE_UNICAST 1
-
-// Checksum : A ALIGNER AVEC TOUTE LA CLASSE
-#define CHECKSUM_AVEC_SYNC 1          // 1 = la somme inclut l'octet 0xAA (octets 1 a 3 du tableau)
-// 256 = somme tronquee sur 8 bits. C'est ce que font les noeuds observes sur le reseau
-//       (trame AA 88 1B 4D : AA+88+1B = 333, et 333 % 256 = 0x4D).
-// 255 = modulo 255, comme ecrit dans le sujet. Les deux ne divergent que si la somme
-//       depasse 255, d'ou des rejets intermittents si tout le monde n'a pas la meme valeur.
-const uint16_t CHECKSUM_MODULO = 256;
 
 // Reseau (tableau : canal C, PAN ID 1234)
 const char RADIO_CANAL[]  = "C";
 const char RADIO_PAN_ID[] = "1234";
 
-// IDs applicatifs (tableau)
-const uint8_t ID_HUB      = 0b000;
-const uint8_t ID_PHOTO    = 0b001;
-const uint8_t ID_TEMP_INT = 0b010;
-const uint8_t ID_SERVO    = 0b011;
-const uint8_t ID_RELAIS   = 0b100;
-const uint8_t ID_TEMP_EXT = 0b101;
-const uint8_t ID_HUMIDITE = 0b110;
-
-// Adresses radio XBee (parametre MY de chaque module), indexees par ID applicatif.
-// Convention proposee : MY = 0x10 + ID. On evite 0x0000, valeur usine de tous les modules.
-// A VALIDER AVEC LES AUTRES GROUPES.
-const uint16_t MY_XBEE[8] = {
-  0x0010,  // 000 Hub
-  0x0011,  // 001 Photoresistance
-  0x0012,  // 010 Temperature interieure
-  0x0013,  // 011 Servomoteur
-  0x0014,  // 100 Relais (nous)
-  0x0015,  // 101 Temperature + humidite exterieure
-  0x0016,  // 110 Humidite            <- A CONFIRMER avec le groupe concerne
-  0xFFFF   // 111 inutilise
+// Adresse 64 bits d'un module XBee (numero de serie SH/SL), reglee via ATDH/ATDL.
+struct AdresseXBee {
+  uint32_t dh;
+  uint32_t dl;
 };
+
+// La lib ne fournit que des macros separees : on les range par NODE_* pour router.
+const AdresseXBee ADRESSES_XBEE[] = {
+  {XBEE_HUB_DH,             XBEE_HUB_DL},              // NODE_HUB
+  {XBEE_RELAI_DH,           XBEE_RELAI_DL},            // NODE_RELAI
+  {XBEE_TEMP_HUM_EXT_DH,    XBEE_TEMP_HUM_EXT_DL},     // NODE_TEMP_HUM_EXT
+  {XBEE_PHOTORESISTANCE_DH, XBEE_PHOTORESISTANCE_DL},  // NODE_PHOTORESISTANCE
+  {XBEE_TEMP_INT_DH,        XBEE_TEMP_INT_DL},         // NODE_TEMP_INT
+  {XBEE_SERVO_STORE_DH,     XBEE_SERVO_STORE_DL},      // NODE_SERVO_STORE
+};
+const uint8_t NB_NOEUDS = sizeof(ADRESSES_XBEE) / sizeof(ADRESSES_XBEE[0]);
+
+const AdresseXBee ADRESSE_BROADCAST = {0x00000000, 0x0000FFFF};
 
 // Temporisations
 const unsigned int  GT_USINE_MS      = 1000;  // guard time par defaut du XBee
@@ -91,8 +81,6 @@ const unsigned long TIMEOUT_TRAME_MS = 100;   // une trame commencee doit finir 
 const unsigned long DUREE_LED_MS     = 60;
 const unsigned long PERIODE_BILAN_MS = 10000;
 
-const uint8_t SYNC = 0xAA;
-
 // Ecran LCD 16x2 en I2C (SDA = A4, SCL = A5 sur Uno)
 const uint8_t LCD_ADRESSE_I2C = 0x27;
 const uint8_t LCD_COLONNES    = 16;
@@ -100,7 +88,7 @@ const uint8_t LCD_LIGNES      = 2;
 
 // Noms d'au plus 6 caracteres pour tenir "exp > dest" sur une ligne de 16.
 const char NOM_COURT[8][7] = {
-  "Hub", "Photo", "TmpInt", "Servo", "Relais", "TmpExt", "Humid", "?"
+  "Hub", "Relais", "TmpExt", "Photo", "TmpInt", "Servo", "?", "?"
 };
 
 // ============================ SERIES / DEBUG ============================
@@ -119,141 +107,138 @@ LiquidCrystal_I2C lcd(LCD_ADRESSE_I2C, LCD_COLONNES, LCD_LIGNES);
 
 // ================================ ETAT =================================
 
-uint8_t       fenetre[4];             // octets en cours de reception
+uint8_t       fenetre[FRAME_TOTAL_SIZE];  // octets en cours de reception
 uint8_t       nbOctets       = 0;
 unsigned long dernierOctetMs = 0;
 
-uint16_t      dlCourant = 0;          // destination radio actuellement reglee
-bool          dlConnu   = false;
+AdresseXBee   destCourante = {0, 0};  // destination radio actuellement reglee
+bool          destConnue   = false;
 
 unsigned long nbRelayees = 0, nbRejetees = 0, nbIgnorees = 0;
 unsigned long ledAllumeeMs = 0, dernierBilanMs = 0;
 
-// ============================ OUTILS TRAME =============================
-
-uint8_t lireDest(const uint8_t* t)  { return (t[1] >> 5) & 0x07; }
-uint8_t lireExp(const uint8_t* t)   { return (t[1] >> 2) & 0x07; }
-uint16_t lireData(const uint8_t* t) { return ((uint16_t)(t[1] & 0x03) << 8) | t[2]; }
-
-uint8_t calculerChecksum(const uint8_t* t) {
-  uint16_t somme = (uint16_t)t[1] + t[2];
-#if CHECKSUM_AVEC_SYNC
-  somme += t[0];
-#endif
-  return somme % CHECKSUM_MODULO;
-}
-
-// Meme somme, mais avec l'autre convention de modulo : sert uniquement au diagnostic.
-uint8_t checksumAutreModulo(const uint8_t* t) {
-  uint16_t somme = (uint16_t)t[1] + t[2];
-#if CHECKSUM_AVEC_SYNC
-  somme += t[0];
-#endif
-  return somme % (CHECKSUM_MODULO == 255 ? 256 : 255);
-}
+// ============================== AFFICHAGE ==============================
 
 void afficherOctet(uint8_t b) {
   if (b < 0x10) DEBUG('0');
   DEBUG(b, HEX);
 }
 
-void afficherId(uint8_t id) {
-  for (int8_t i = 2; i >= 0; i--) DEBUG((id >> i) & 1);
-}
-
 // Nom lisible du noeud, pour les affichages en clair.
 const __FlashStringHelper* nomNoeud(uint8_t id) {
   switch (id) {
-    case ID_HUB:      return F("Hub");
-    case ID_PHOTO:    return F("Photoresistance");
-    case ID_TEMP_INT: return F("Temperature interieure");
-    case ID_SERVO:    return F("Servomoteur");
-    case ID_RELAIS:   return F("Relais");
-    case ID_TEMP_EXT: return F("Temp/humidite exterieure");
-    case ID_HUMIDITE: return F("Humidite");
-    default:          return F("inconnu");
+    case NODE_HUB:             return F("Hub");
+    case NODE_RELAI:           return F("Relais");
+    case NODE_TEMP_HUM_EXT:    return F("Temp/humidite exterieure");
+    case NODE_PHOTORESISTANCE: return F("Photoresistance");
+    case NODE_TEMP_INT:        return F("Temperature interieure");
+    case NODE_SERVO_STORE:     return F("Servomoteur");
+    default:                   return F("inconnu");
   }
 }
 
-// Adresse radio (parametre MY) associee a un ID applicatif : "0x0012".
+void afficherHex32(uint32_t valeur) {
+  for (int8_t i = 28; i >= 0; i -= 4) DEBUG((uint8_t)((valeur >> i) & 0x0F), HEX);
+}
+
+// "0013A200 40A1B2C3"
 // En mode transparent le XBee ne nous transmet pas l'adresse source du paquet,
 // on ne peut donc afficher que l'adresse *attendue* d'apres le champ exp.
-void afficherAdresse(uint16_t adresse) {
-  DEBUG(F("0x"));
-  for (int8_t i = 12; i >= 0; i -= 4) {
-    uint8_t quartet = (adresse >> i) & 0x0F;
-    DEBUG(quartet, HEX);
-  }
+void afficherAdresse(const AdresseXBee& a) {
+  afficherHex32(a.dh);
+  DEBUG(' ');
+  afficherHex32(a.dl);
 }
 
-// "Hub (000)" ou, avec adresse=true, "Hub (000), MY attendu 0x0010"
+// "Hub (0)" ou, avec adresse=true, "Hub (0), adresse attendue 0013A200 40A1B2C3"
 void afficherNoeud(uint8_t id, bool adresse = false) {
   DEBUG(nomNoeud(id));
   DEBUG(F(" ("));
-  afficherId(id);
+  DEBUG(id);
   DEBUG(')');
-  if (adresse) {
-    DEBUG(F(", MY attendu "));
-    afficherAdresse(MY_XBEE[id]);
+  if (adresse && id < NB_NOEUDS) {
+    DEBUG(F(", adresse attendue "));
+    afficherAdresse(ADRESSES_XBEE[id]);
+  }
+}
+
+const __FlashStringHelper* nomCommande(FrameCmd_t cmd) {
+  switch (cmd) {
+    case FRAME_CMD_READ:  return F("READ");
+    case FRAME_CMD_WRITE: return F("WRITE");
+    case FRAME_CMD_ERROR: return F("ERROR");
+    default:              return F("?");
   }
 }
 
 // Les 4 octets en hexa : "AA 4A 1F 73"
 void afficherOctets(const uint8_t* t) {
-  for (uint8_t i = 0; i < 4; i++) {
+  for (uint8_t i = 0; i < FRAME_TOTAL_SIZE; i++) {
     if (i) DEBUG(' ');
     afficherOctet(t[i]);
   }
 }
 
-// Trame decodee en texte, sur plusieurs lignes :
-//   RX trame : AA 4A 1F 73
-//      de       : Hub (000), MY attendu 0x0010
-//      vers     : Temperature interieure (010)
-//      donnees  : 543 (0x21F)
-//      checksum : 0x73 (correct)
-void afficherTrame(const uint8_t* t) {
-  uint16_t data = lireData(t);
-
-  DEBUG(F("RX trame : "));
-  afficherOctets(t);
-  DEBUGLN();
-
-  DEBUG(F("   de       : "));  afficherNoeud(lireExp(t), true);  DEBUGLN();
-  DEBUG(F("   vers     : "));  afficherNoeud(lireDest(t)); DEBUGLN();
-
-  DEBUG(F("   donnees  : "));  DEBUG(data);
-  DEBUG(F(" (0x"));            DEBUG(data, HEX);
-  DEBUGLN(')');
-
-  DEBUG(F("   checksum : 0x")); afficherOctet(t[3]);
-  DEBUGLN(calculerChecksum(t) == t[3] ? F(" (correct)") : F(" (FAUX)"));
+void afficherMessage(const FrameMsg_t& msg) {
+  uint8_t octets[FRAME_TOTAL_SIZE];
+  frame_pack(&msg, octets);
+  afficherOctets(octets);
 }
 
-// Ligne 1 : "TmpInt > Hub"   Ligne 2 : "Valeur: 24"
-void afficherTrameLcd(const uint8_t* t) {
+// Trame decodee en texte, sur plusieurs lignes :
+//   RX trame : AA 81 1D 48
+//      de       : Hub (0), adresse attendue 0013A200 40A1B2C3
+//      vers     : Temperature interieure (4)
+//      commande : WRITE
+//      valeur   : 29 (0x1D)
+void afficherTrame(const FrameMsg_t& msg) {
+  DEBUG(F("RX trame : "));
+  afficherMessage(msg);
+  DEBUGLN();
+
+  DEBUG(F("   de       : "));  afficherNoeud(msg.src_id, true);  DEBUGLN();
+  DEBUG(F("   vers     : "));  afficherNoeud(msg.dest_id);       DEBUGLN();
+  DEBUG(F("   commande : "));  DEBUGLN(nomCommande(msg.cmd));
+
+  DEBUG(F("   valeur   : "));  DEBUG(msg.value);
+  DEBUG(F(" (0x"));            DEBUG(msg.value, HEX);
+  DEBUGLN(')');
+}
+
+// Ligne 1 : "TmpInt > Hub"   Ligne 2 : "WRITE val 24"
+void afficherTrameLcd(const FrameMsg_t& msg) {
   lcd.clear();
-  lcd.print(NOM_COURT[lireExp(t)]);
+  lcd.print(NOM_COURT[msg.src_id]);
   lcd.print(F(" > "));
-  lcd.print(NOM_COURT[lireDest(t)]);
+  lcd.print(NOM_COURT[msg.dest_id]);
   lcd.setCursor(0, 1);
-  lcd.print(F("Valeur: "));
-  lcd.print(lireData(t));
+  lcd.print(nomCommande(msg.cmd));
+  lcd.print(F(" val "));
+  lcd.print(msg.value);
 }
 
 // ============================== RECEPTION ==============================
 
-// Apres un checksum faux, le 0xAA de depart etait peut-etre une donnee :
+// Apres un rejet, le 0xAA de depart etait peut-etre une valeur :
 // on cherche une autre synchro dans les octets deja recus au lieu de tout jeter.
+// (frame_parse_byte de la lib n'a ni cette resynchro ni de timeout, d'ou cette lecture maison.)
 void resynchroniser() {
   uint8_t i = 1;
-  while (i < 4 && fenetre[i] != SYNC) i++;
-  nbOctets = 4 - i;
+  while (i < FRAME_TOTAL_SIZE && fenetre[i] != FRAME_START_BYTE) i++;
+  nbOctets = FRAME_TOTAL_SIZE - i;
   memmove(fenetre, fenetre + i, nbOctets);
 }
 
-// Renvoie true et remplit 'trame' quand une trame valide est recue.
-bool lireTrame(uint8_t* trame) {
+void signalerRejet() {
+  nbRejetees++;
+  DEBUG(F("! trame rejetee : "));
+  afficherOctets(fenetre);
+  // 0b10 est la seule valeur de cmd que frame_unpack refuse
+  DEBUGLN((fenetre[1] & 0x03) == 0x02 ? F(" (commande 10 reservee)") : F(" (checksum faux)"));
+}
+
+// Renvoie true et remplit 'msg' quand une trame valide est recue.
+bool lireTrame(FrameMsg_t& msg) {
   if (nbOctets > 0 && millis() - dernierOctetMs > TIMEOUT_TRAME_MS) {
     nbOctets = 0;  // trame incomplete abandonnee
   }
@@ -262,28 +247,16 @@ bool lireTrame(uint8_t* trame) {
     uint8_t b = xbee.read();
     dernierOctetMs = millis();
 
-    if (nbOctets == 0 && b != SYNC) continue;  // on attend la synchro
+    if (nbOctets == 0 && b != FRAME_START_BYTE) continue;  // on attend la synchro
     fenetre[nbOctets++] = b;
+    if (nbOctets < FRAME_TOTAL_SIZE) continue;
 
-    if (nbOctets == 4) {
-      if (calculerChecksum(fenetre) == fenetre[3]) {
-        memcpy(trame, fenetre, 4);
-        nbOctets = 0;
-        return true;
-      }
-      nbRejetees++;
-      DEBUG(F("! trame rejetee (checksum faux) : "));
-      afficherOctets(fenetre);
-      DEBUG(F(" -> attendu 0x"));
-      afficherOctet(calculerChecksum(fenetre));
-      if (fenetre[3] == checksumAutreModulo(fenetre)) {
-        DEBUG(F(" (l'emetteur utilise le modulo "));
-        DEBUG(CHECKSUM_MODULO == 255 ? 256 : 255);
-        DEBUG(F(" : convention a aligner)"));
-      }
-      DEBUGLN();
-      resynchroniser();
+    if (frame_unpack(fenetre, &msg)) {
+      nbOctets = 0;
+      return true;
     }
+    signalerRejet();
+    resynchroniser();
   }
   return false;
 }
@@ -318,56 +291,72 @@ bool envoyerAT(const __FlashStringHelper* cmd, const char* param) {
   return attendreOK(500);
 }
 
+bool envoyerATHex(const __FlashStringHelper* cmd, uint32_t valeur) {
+  char hex[9];
+  sprintf(hex, "%lX", (unsigned long)valeur);
+  return envoyerAT(cmd, hex);
+}
+
 bool quitterModeCommande() {
   xbee.print(F("ATCN\r"));
   return attendreOK(500);
+}
+
+bool adresseRenseignee(uint8_t id) {
+  return ADRESSES_XBEE[id].dl != 0;
+}
+
+// Tant qu'une adresse est encore a 0 dans ecostore_nodes.h (TODO), on envoie en broadcast.
+const AdresseXBee& adresseVers(uint8_t id) {
+#if MODE_UNICAST
+  if (adresseRenseignee(id)) return ADRESSES_XBEE[id];
+#else
+  (void)id;
+#endif
+  return ADRESSE_BROADCAST;
 }
 
 // Configure le XBee du relais a chaque demarrage (pas de ATWR : rien n'est ecrit en flash).
 bool configurerXBee() {
   if (!entrerModeCommande(GT_USINE_MS)) return false;
 
-  char my[5], dl[5];
-  sprintf(my, "%X", (unsigned int)MY_XBEE[ID_RELAIS]);
-#if MODE_UNICAST
-  sprintf(dl, "%X", (unsigned int)MY_XBEE[ID_HUB]);
-#else
-  sprintf(dl, "FFFF");
-#endif
+  const AdresseXBee& dest = adresseVers(NODE_HUB);
 
   bool ok = true;
   ok &= envoyerAT(F("ATAP"), "0");           // mode transparent
   ok &= envoyerAT(F("ATCH"), RADIO_CANAL);
   ok &= envoyerAT(F("ATID"), RADIO_PAN_ID);
-  ok &= envoyerAT(F("ATMY"), my);
-  ok &= envoyerAT(F("ATDH"), "0");           // adressage 16 bits
-  ok &= envoyerAT(F("ATDL"), dl);
+  ok &= envoyerATHex(F("ATDH"), dest.dh);    // DH != 0 : adressage 64 bits, MY ignore
+  ok &= envoyerATHex(F("ATDL"), dest.dl);
   ok &= envoyerAT(F("ATGT"), "32");          // guard time 0x32 = 50 ms
   ok &= quitterModeCommande();
 
-  if (ok) {
-#if MODE_UNICAST
-    dlCourant = MY_XBEE[ID_HUB];
-#else
-    dlCourant = 0xFFFF;
-#endif
-    dlConnu = true;
-  }
+  if (ok) { destCourante = dest; destConnue = true; }
   return ok;
 }
 
+void signalerAdressesManquantes() {
+  for (uint8_t id = 0; id < NB_NOEUDS; id++) {
+    if (adresseRenseignee(id)) continue;
+    DEBUG(F("! adresse XBee non renseignee pour "));
+    afficherNoeud(id);
+    DEBUGLN(F(" : envoi en broadcast"));
+  }
+}
+
 // Change la destination radio, seulement si elle est differente de l'actuelle.
-bool changerDestinationRadio(uint16_t adresse) {
-  if (dlConnu && adresse == dlCourant) return true;
+// DH etant le meme prefixe Digi pour tous les modules, en general seul ATDL part.
+bool changerDestinationRadio(const AdresseXBee& adresse) {
+  bool memeDh = destConnue && adresse.dh == destCourante.dh;
+  if (memeDh && adresse.dl == destCourante.dl) return true;
   if (!entrerModeCommande(GT_RAPIDE_MS)) return false;
 
-  char dl[5];
-  sprintf(dl, "%X", (unsigned int)adresse);
-  bool ok = envoyerAT(F("ATDL"), dl);
+  bool ok = memeDh || envoyerATHex(F("ATDH"), adresse.dh);
+  ok = ok && envoyerATHex(F("ATDL"), adresse.dl);
   ok = quitterModeCommande() && ok;
 
-  if (ok) { dlCourant = adresse; dlConnu = true; }
-  else    { dlConnu = false; }
+  if (ok) { destCourante = adresse; destConnue = true; }
+  else    { destConnue = false; }
   return ok;
 }
 
@@ -376,81 +365,75 @@ bool changerDestinationRadio(uint16_t adresse) {
 // Noeuds hors de portee du Hub : c'est pour eux que le relais existe.
 // Ajouter ou retirer un noeud ici suffit, les deux sens suivent.
 bool noeudDerriereRelais(uint8_t id) {
-  return id == ID_TEMP_INT    // 010, P20
-      || id == ID_SERVO       // 011, P20
-      || id == ID_HUMIDITE;   // 110
+  return id == NODE_TEMP_INT       // P20
+      || id == NODE_SERVO_STORE;   // P20
 }
 
 // Renvoie l'ID vers lequel relayer la trame, ou -1 pour l'ignorer.
 int8_t cibleRelais(uint8_t dest, uint8_t exp) {
-  if (exp == ID_HUB && noeudDerriereRelais(dest)) return dest;    // Hub -> noeud
-  if (dest == ID_HUB && noeudDerriereRelais(exp)) return ID_HUB;  // noeud -> Hub
+  if (exp == NODE_HUB && noeudDerriereRelais(dest)) return dest;      // Hub -> noeud
+  if (dest == NODE_HUB && noeudDerriereRelais(exp)) return NODE_HUB;  // noeud -> Hub
   return -1;
 }
 
-bool envoyerVers(uint8_t id, const uint8_t* trame) {
-#if MODE_UNICAST
-  if (!changerDestinationRadio(MY_XBEE[id])) return false;
-#else
-  (void)id;
-#endif
-  xbee.write(trame, 4);
+bool envoyerVers(uint8_t id, const FrameMsg_t& msg) {
+  if (!changerDestinationRadio(adresseVers(id))) return false;
+  uint8_t trame[FRAME_TOTAL_SIZE];
+  frame_pack(&msg, trame);
+  xbee.write(trame, FRAME_TOTAL_SIZE);
   return true;
 }
 
-// Le checksum est calcule a l'envoi pour suivre CHECKSUM_MODULO.
-const uint8_t TRAMES_TEST_SERVO[][3] = {
-  {0xAA, 0x60, 0x01},  // ouvrir
-  {0xAA, 0x60, 0x00},  // fermer
-  {0xAA, 0x60, 0x02},  // demande d'etat
+// Commandes a confirmer avec le groupe servo.
+const FrameMsg_t TRAMES_TEST_SERVO[] = {
+  {NODE_SERVO_STORE, NODE_HUB, FRAME_CMD_WRITE, 1},  // ouvrir
+  {NODE_SERVO_STORE, NODE_HUB, FRAME_CMD_WRITE, 0},  // fermer
+  {NODE_SERVO_STORE, NODE_HUB, FRAME_CMD_READ,  0},  // demande d'etat
 };
 
 void testActionneur() {
-  for (const uint8_t* entete : TRAMES_TEST_SERVO) {
-    uint8_t trame[4] = {entete[0], entete[1], entete[2], 0};
-    trame[3] = calculerChecksum(trame);
+  for (const FrameMsg_t& msg : TRAMES_TEST_SERVO) {
     DEBUG(F("TX test : "));
-    afficherOctets(trame);
-    DEBUGLN(envoyerVers(ID_SERVO, trame) ? F("") : F("  ! echec ATDL"));
-    afficherTrameLcd(trame);
+    afficherMessage(msg);
+    DEBUGLN(envoyerVers(NODE_SERVO_STORE, msg) ? F("") : F("  ! echec ATDH/ATDL"));
+    afficherTrameLcd(msg);
     delay(DELAI_TEST_MS);
   }
 }
 
-void traiterTrame(const uint8_t* t) {
-  afficherTrame(t);
-  afficherTrameLcd(t);
+void traiterTrame(const FrameMsg_t& msg) {
+  afficherTrame(msg);
+  afficherTrameLcd(msg);
 
-  uint8_t dest = lireDest(t);
-  if (dest == ID_RELAIS) {
+  if (msg.dest_id == NODE_RELAI) {
     // Trame adressee au relais lui-meme : rien de prevu dans le protocole pour l'instant.
     nbIgnorees++;
     DEBUGLN(F("   -> adressee au relais lui-meme : non geree"));
     return;
   }
 
-  int8_t cible = cibleRelais(dest, lireExp(t));
+  int8_t cible = cibleRelais(msg.dest_id, msg.src_id);
   if (cible < 0) {
     nbIgnorees++;
     DEBUGLN(F("   -> ignoree : ce couple expediteur/destinataire ne passe pas par le relais"));
     return;
   }
 
-  if (envoyerVers(cible, t)) {
+  if (envoyerVers(cible, msg)) {
     nbRelayees++;
     DEBUG(F("   -> relayee vers "));
     afficherNoeud(cible);
-#if MODE_UNICAST
-    DEBUG(F(", DL "));
-    afficherAdresse(dlCourant);
-#else
-    DEBUG(F(", en broadcast"));
-#endif
+    if (destCourante.dl == ADRESSE_BROADCAST.dl) {
+      DEBUG(F(", en broadcast"));
+    } else {
+      DEBUG(F(", adresse "));
+      afficherAdresse(destCourante);
+    }
     DEBUGLN();
     digitalWrite(LED_BUILTIN, HIGH);
     ledAllumeeMs = millis();
   } else {
-    DEBUGLN(F("   ! echec du changement de destination radio (ATDL)"));
+    DEBUGLN(F("   ! echec du changement de destination radio (ATDH/ATDL)"));
   }
 }
 
@@ -461,15 +444,15 @@ void setup() {
 #if XBEE_SUR_SOFTSERIAL
   Serial.begin(BAUD_DEBUG);
 #endif
-  xbee.begin(BAUD_XBEE);
+  xbee.begin(XBEE_BAUD);
 
   lcd.init();
   lcd.backlight();
-  lcd.print(F("Relais 100"));
+  lcd.print(F("Relais 1"));
   lcd.setCursor(0, 1);
   lcd.print(F("En attente..."));
 
-  DEBUGLN(F("=== RELAIS (ID 100) ==="));
+  DEBUGLN(F("=== RELAIS (ID 1) ==="));
   DEBUG(F("Configuration XBee... "));
   if (configurerXBee()) {
     DEBUGLN(F("OK"));
@@ -480,14 +463,17 @@ void setup() {
       digitalWrite(LED_BUILTIN, LOW);  delay(100);
     }
   }
+#if MODE_UNICAST
+  signalerAdressesManquantes();
+#endif
   dernierBilanMs = millis();
 }
 
 void loop() {
   if (debug) testActionneur();
 
-  uint8_t trame[4];
-  if (lireTrame(trame)) traiterTrame(trame);
+  FrameMsg_t msg;
+  if (lireTrame(msg)) traiterTrame(msg);
 
   if (ledAllumeeMs && millis() - ledAllumeeMs > DUREE_LED_MS) {
     digitalWrite(LED_BUILTIN, LOW);
