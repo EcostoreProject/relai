@@ -1,0 +1,4 @@
+[submodule "libraries"]
+	path = libraries
+	url = ../libraries
+	branch = main
